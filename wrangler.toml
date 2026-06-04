@@ -1,0 +1,34 @@
+name = "freeagentstore-mcp"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+API_BASE = "https://api.freeagentstore.online"
+GITHUB_ORG = "FreeAgentStore"
+
+[[routes]]
+pattern = "mcp.freeagentstore.online/*"
+zone_name = "freeagentstore.online"
+
+# Secrets (set via `wrangler secret put`):
+#   SESSION_SIGNING_KEY — HMAC key for session verification + OAuth
+#   GITHUB_TOKEN — Fine-grained PAT for FreeAgentStore org
+
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "da354fa2f773497b93671d3f2fdd2979"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "fags"
+database_id = "2f5cd397-8566-4e45-a76c-84553b701c02"
+
+[durable_objects]
+bindings = [
+  { name = "MCP_OBJECT", class_name = "FagsMcpAgent" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["FagsMcpAgent"]
