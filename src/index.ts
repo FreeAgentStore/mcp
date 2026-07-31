@@ -522,10 +522,11 @@ export default {
 
     // Everything else 404s rather than falling through to serve(). On
     // agents@0.0.74 the fallthrough happened to 405, because serve() matches
-    // POST-on-basePattern only. But agents>=0.14 routes a bare GET on ANY path
-    // to handleLegacySse() with no basePattern check, so a routine dependency
-    // bump would silently turn "GET /anything -> 405" into "GET /anything ->
-    // opens a DO-backed SSE stream". Pin the surface here instead.
+    // POST-on-basePattern only, and agents>=0.14's default streamable-http
+    // handler gates on its own basePattern too — so this was already harmless.
+    // But that is library internals, not a contract: `transport: "auto"` in
+    // agents>=0.14 dispatches a bare GET to the legacy SSE handler without
+    // re-checking the base path. Own the routing here instead.
     return new Response("Not found — the MCP endpoint is /mcp", { status: 404 });
   },
 };
