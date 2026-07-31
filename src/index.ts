@@ -486,6 +486,7 @@ export default {
     }
 
     if (url.pathname === "/" || url.pathname === "") {
+      if (isProtocolClient(request)) return wrongEndpoint();
       return new Response(
         [
           "FreeAgentStore MCP Server",
@@ -519,6 +520,46 @@ export default {
       return FagsMcpAgent.serve("/mcp").fetch(modifiedRequest, env, ctx);
     }
 
-    return FagsMcpAgent.serve("/mcp").fetch(request, env, ctx);
+    // Everything else 404s rather than falling through to serve(). On
+    // agents@0.0.74 the fallthrough happened to 405, because serve() matches
+    // POST-on-basePattern only. But agents>=0.14 routes a bare GET on ANY path
+    // to handleLegacySse() with no basePattern check, so a routine dependency
+    // bump would silently turn "GET /anything -> 405" into "GET /anything ->
+    // opens a DO-backed SSE stream". Pin the surface here instead.
+    return new Response("Not found — the MCP endpoint is /mcp", { status: 404 });
   },
 };
+
+/**
+ * Is this an MCP protocol client rather than a person in a browser?
+ *
+ * A client pointed at the origin instead of `/mcp` asks for the event stream
+ * with `GET / Accept: text/event-stream` (the legacy SSE transport), or POSTs
+ * JSON-RPC. Answering either with 200 and a short non-stream body tells the
+ * client "stream opened" and then drops it — and the spec-correct response to a
+ * dropped stream is to reconnect, so it redials ~1/sec, forever. The flood is
+ * invisible: every response is a 200, nothing throws, no AI tokens are spent,
+ * nothing is written to D1, and the MCP rate limiter only counts `tools/call`
+ * messages carrying an account, which a bare GET has neither of.
+ *
+ * OPTIONS and HEAD deliberately return false so CORS preflight is unaffected.
+ */
+function isProtocolClient(request: Request): boolean {
+  if (request.method === "POST") return true;
+  return (request.headers.get("accept") ?? "").includes("text/event-stream");
+}
+
+/** The JSON-RPC 405 the MCP spec requires from an endpoint with no stream to offer. */
+function wrongEndpoint(): Response {
+  return new Response(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: null,
+      error: {
+        code: -32000,
+        message: "Method Not Allowed — the MCP endpoint is https://mcp.freeagentstore.online/mcp",
+      },
+    }),
+    { status: 405, headers: { "content-type": "application/json", allow: "GET, HEAD" } },
+  );
+}
