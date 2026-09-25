@@ -1,11 +1,15 @@
-// FAS session token verification — vendored from fas/platform/packages/backend/src/lib/session.ts.
-// Tokens are HMAC-SHA256 signed: base64url(payload) + "." + base64url(hmac).
+// FAGS session token verification — must match the FAGS host's createSession()
+// (FreeAgentStore/platform workers/host/src/api.ts): HMAC-SHA256 over
+// base64(JSON payload), signature hex-encoded.
+// Token format: base64(payload) + "." + hex(hmac).
 
 export interface SessionPayload {
   uid: string;
+  login?: string;
+  avatar?: string;
   roles?: string[];
   appRoles?: Record<string, string[]>;
-  iat: number;
+  iat?: number;
   exp: number;
 }
 
@@ -17,19 +21,19 @@ export async function verifySession(
   if (dot < 0) return null;
   const body = token.slice(0, dot);
   const sig = token.slice(dot + 1);
-  const expected = await hmac(body, signingKey);
+  const expected = await hmacHex(body, signingKey);
   if (!timingSafeEqual(sig, expected)) return null;
   let payload: SessionPayload;
   try {
-    payload = JSON.parse(b64urlDecode(body)) as SessionPayload;
+    payload = JSON.parse(atob(body)) as SessionPayload;
   } catch {
     return null;
   }
-  if (payload.exp < Math.floor(Date.now() / 1000)) return null;
+  if (typeof payload.exp !== 'number' || payload.exp < Math.floor(Date.now() / 1000)) return null;
   return payload;
 }
 
-async function hmac(data: string, keyMaterial: string): Promise<string> {
+async function hmacHex(data: string, keyMaterial: string): Promise<string> {
   const key = await crypto.subtle.importKey(
     'raw',
     new TextEncoder().encode(keyMaterial),
@@ -38,18 +42,9 @@ async function hmac(data: string, keyMaterial: string): Promise<string> {
     ['sign'],
   );
   const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
-  return b64urlBytes(new Uint8Array(sig));
-}
-
-function b64urlBytes(bytes: Uint8Array): string {
-  let bin = '';
-  for (const b of bytes) bin += String.fromCharCode(b);
-  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
-function b64urlDecode(s: string): string {
-  const padded = s.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((s.length + 3) % 4);
-  return atob(padded);
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
 }
 
 function timingSafeEqual(a: string, b: string): boolean {

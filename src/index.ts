@@ -2,7 +2,9 @@ import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { verifySession } from "./session.js";
-import { handleOAuthRoute, resolveOAuthToken } from "./oauth-provider.js";
+import { handleOAuthRoute, oauthConfigFromEnv, resolveOAuthToken } from "./oauth-provider.js";
+import { audit, dryRun, errText, requireConfirmation, requireWritable, type SafetyContext } from "./safety.js";
+import { AGENT_ID_RE, isSafeRepoPath } from "./guards.js";
 
 interface Env {
   API_BASE: string;
@@ -11,6 +13,8 @@ interface Env {
   SESSION_SIGNING_KEY?: string;
   OAUTH_KV?: KVNamespace;
   DB?: D1Database;
+  FAGS_AUTH_START?: string;
+  MCP_READ_ONLY?: string;
 }
 
 export interface McpProps extends Record<string, unknown> {
@@ -20,7 +24,10 @@ export interface McpProps extends Record<string, unknown> {
 
 // ── GitHub helpers ────────────────────────────────────────────
 
-async function ghApi(path: string, opts?: { method?: string; body?: unknown; token?: string }) {
+async function ghApi(
+  path: string,
+  opts?: { method?: string; body?: unknown; token?: string },
+): Promise<Record<string, unknown>> {
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
     "User-Agent": "freeagentstore-mcp",
@@ -33,7 +40,7 @@ async function ghApi(path: string, opts?: { method?: string; body?: unknown; tok
   });
   if (!res.ok) return { error: `GitHub API ${res.status}: ${await res.text()}` };
   if (res.status === 204) return {};
-  return await res.json();
+  return (await res.json()) as Record<string, unknown>;
 }
 
 async function getDeployStatus(org: string, agentId: string) {
@@ -51,7 +58,7 @@ async function getDeployStatus(org: string, agentId: string) {
   }));
 }
 
-// ── FAS API helper ────────────────────────────────────────────
+// ── FAGS API helper ───────────────────────────────────────────
 
 async function fagsApi(apiBase: string, path: string, token?: string) {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -68,6 +75,48 @@ export class FagsMcpAgent extends McpAgent<Env, unknown, McpProps> {
     name: "FreeAgentStore",
     version: "0.1.0",
   });
+
+  /** Safety context for the current caller: env for the read-only flag + audit
+   *  KV, and the user id the audit trail is keyed on. */
+  private safety(): SafetyContext {
+    return { env: this.env, subject: this.props?.userId ?? "" };
+  }
+
+  /**
+   * Common gate for every write tool: signed in, worker writable, and — when
+   * `agentId` is given — the caller owns that agent by D1 `routes.owner_id`.
+   * Returns an error result (and audits the refusal) or null when allowed.
+   */
+  private async guardWrite(
+    tool: string,
+    input: Record<string, unknown>,
+    agentId?: string,
+  ): Promise<ReturnType<typeof errText> | null> {
+    const uid = this.props?.userId;
+    if (!uid) return errText("Not authenticated. Connect via OAuth or a FAGS session token.");
+    const ctx = this.safety();
+    const readOnly = requireWritable(ctx);
+    if (readOnly) {
+      await audit(ctx, { tool, action: "blocked", input, result: "read-only" });
+      return readOnly;
+    }
+    if (agentId !== undefined && !(await this.ownsAgent(agentId, uid))) {
+      await audit(ctx, { tool, action: "blocked", input, result: "not owner" });
+      return errText(`You don't own agent **${agentId}** (or it isn't registered).`);
+    }
+    return null;
+  }
+
+  /** Does `uid` own this agent? Legacy rows without owner_id deny writes. */
+  private async ownsAgent(agentId: string, uid: string): Promise<boolean> {
+    if (!this.env.DB) return false;
+    const row = await this.env.DB.prepare(
+      "SELECT owner_id FROM routes WHERE slug = ? AND zone = 'freeagentstore.online'",
+    )
+      .bind(agentId)
+      .first<{ owner_id: string | null }>();
+    return !!row?.owner_id && row.owner_id === uid;
+  }
 
   async init() {
     // ── list_agents ────────────────────────────────────────
@@ -141,27 +190,40 @@ export class FagsMcpAgent extends McpAgent<Env, unknown, McpProps> {
       }
     );
 
+    // Every write tool below: auth + read-only guard (guardWrite), ownership by
+    // D1 routes.owner_id for existing agents, dry_run, and a KV audit trail.
+    // delete_agent is destructive and additionally requires confirm=<agent_id>.
+
     // ── create_agent ───────────────────────────────────────
     this.server.tool(
       "create_agent",
-      "Create a new agent on FreeAgentStore — provisions GitHub repo, R2 route, and DNS. Requires auth + GITHUB_TOKEN.",
+      "Create a new agent on FreeAgentStore — provisions GitHub repo, R2 route, and DNS. Requires auth + GITHUB_TOKEN. You become the owner. Supports dry_run.",
       {
-        agent_id: z.string().regex(/^[a-z0-9-]+$/).describe("Agent slug (lowercase, hyphens allowed)"),
+        agent_id: z.string().regex(AGENT_ID_RE).describe("Agent slug (lowercase, hyphens allowed)"),
         name: z.string().describe("Display name"),
         description: z.string().describe("Short description"),
         template: z.enum(["agent-tts", "agent-whisper", "agent-vision", "agent-llm", "agent-tools"]).optional().describe("Template to scaffold from"),
+        dry_run: z.boolean().optional().describe("Preview without creating anything"),
       },
-      async ({ agent_id, name, description, template }) => {
-        const token = this.props.token;
-        if (!token) return text("Not authenticated. Connect with a session token to create agents.");
-        if (!this.env.GITHUB_TOKEN) return text("GITHUB_TOKEN not configured on MCP server.");
-        if (!this.env.DB) return text("D1 not configured.");
+      async ({ agent_id, name, description, template, dry_run }) => {
+        const input = { agent_id, name, description, template };
+        const blocked = await this.guardWrite("create_agent", input);
+        if (blocked) return blocked;
+        if (!this.env.GITHUB_TOKEN) return errText("GITHUB_TOKEN not configured on MCP server.");
+        if (!this.env.DB) return errText("D1 not configured.");
+        const ctx = this.safety();
+        const uid = this.props.userId as string;
 
         const org = this.env.GITHUB_ORG;
 
         // 1. Check if agent already exists
         const existing = await this.env.DB.prepare("SELECT slug FROM routes WHERE slug = ? AND zone = 'freeagentstore.online'").bind(agent_id).first();
-        if (existing) return text(`Agent **${agent_id}** already exists at https://${agent_id}.freeagentstore.online`);
+        if (existing) return errText(`Agent **${agent_id}** already exists at https://${agent_id}.freeagentstore.online`);
+
+        if (dry_run) {
+          await audit(ctx, { tool: "create_agent", action: "dry_run", input });
+          return dryRun("create_agent", input);
+        }
 
         // 2. Create GitHub repo
         const repo = await ghApi(`/orgs/${org}/repos`, {
@@ -174,12 +236,17 @@ export class FagsMcpAgent extends McpAgent<Env, unknown, McpProps> {
             visibility: "public",
           },
         });
-        if ("error" in repo) return text(`Failed to create repo: ${(repo as { error: string }).error}`);
+        if ("error" in repo) {
+          const error = (repo as { error: string }).error;
+          await audit(ctx, { tool: "create_agent", action: "failed", input, result: error });
+          return errText(`Failed to create repo: ${error}`);
+        }
 
-        // 3. Insert D1 route
+        // 3. Insert D1 route, owned by the caller
         await this.env.DB.prepare(
-          "INSERT INTO routes (slug, zone, r2_prefix, store, hosted_on, created_at, updated_at) VALUES (?, 'freeagentstore.online', ?, 'agents', 'r2', strftime('%s','now'), strftime('%s','now'))"
-        ).bind(agent_id, `agents/${agent_id}`).run();
+          "INSERT INTO routes (slug, zone, r2_prefix, store, hosted_on, owner_id, created_at, updated_at) VALUES (?, 'freeagentstore.online', ?, 'agents', 'r2', ?, strftime('%s','now'), strftime('%s','now'))"
+        ).bind(agent_id, `agents/${agent_id}`, uid).run();
+        await audit(ctx, { tool: "create_agent", action: "success", input });
 
         return text([
           `Agent **${agent_id}** created!`,
@@ -198,22 +265,36 @@ export class FagsMcpAgent extends McpAgent<Env, unknown, McpProps> {
     // ── delete_agent ───────────────────────────────────────
     this.server.tool(
       "delete_agent",
-      "Remove an agent from the store (deletes route, optionally archives repo). Requires auth.",
+      "Remove an agent from the store (deletes route, optionally archives repo). Requires ownership. Destructive: requires confirm=<agent_id>. Supports dry_run.",
       {
-        agent_id: z.string().describe("Agent ID to remove"),
+        agent_id: z.string().regex(AGENT_ID_RE).describe("Agent ID to remove"),
         archive_repo: z.boolean().optional().describe("Archive the GitHub repo (default: false)"),
+        dry_run: z.boolean().optional().describe("Preview without deleting"),
+        confirm: z.string().optional().describe("Must equal `agent_id` to proceed"),
       },
-      async ({ agent_id, archive_repo }) => {
-        const token = this.props.token;
-        if (!token) return text("Not authenticated.");
-        if (!this.env.DB) return text("D1 not configured.");
+      async ({ agent_id, archive_repo, dry_run, confirm }) => {
+        const input = { agent_id, archive_repo };
+        const blocked = await this.guardWrite("delete_agent", input, agent_id);
+        if (blocked) return blocked;
+        if (!this.env.DB) return errText("D1 not configured.");
+        const ctx = this.safety();
+
+        if (dry_run) {
+          await audit(ctx, { tool: "delete_agent", action: "dry_run", input });
+          return dryRun("delete_agent", input);
+        }
+        const unconfirmed = requireConfirmation(ctx, "delete_agent", confirm, agent_id);
+        if (unconfirmed) {
+          await audit(ctx, { tool: "delete_agent", action: "blocked", input, result: "missing confirmation" });
+          return unconfirmed;
+        }
 
         // Remove D1 route
         const result = await this.env.DB.prepare(
           "DELETE FROM routes WHERE slug = ? AND zone = 'freeagentstore.online'"
         ).bind(agent_id).run();
 
-        if (!result.meta.changes) return text(`Agent **${agent_id}** not found in routes.`);
+        if (!result.meta.changes) return errText(`Agent **${agent_id}** not found in routes.`);
 
         // Optionally archive repo
         if (archive_repo && this.env.GITHUB_TOKEN) {
@@ -223,6 +304,7 @@ export class FagsMcpAgent extends McpAgent<Env, unknown, McpProps> {
             body: { archived: true },
           });
         }
+        await audit(ctx, { tool: "delete_agent", action: "success", input });
 
         return text(`Agent **${agent_id}** removed from store.${archive_repo ? " Repo archived." : ""}`);
       }
@@ -231,17 +313,28 @@ export class FagsMcpAgent extends McpAgent<Env, unknown, McpProps> {
     // ── write_file ─────────────────────────────────────────
     this.server.tool(
       "write_file",
-      "Write or update a file in an agent's GitHub repo (commits to main). Requires auth + GITHUB_TOKEN.",
+      "Write or update a file in an agent's GitHub repo (commits to main). Requires ownership + GITHUB_TOKEN. Supports dry_run.",
       {
-        agent_id: z.string().describe("Agent ID (repo name)"),
+        agent_id: z.string().regex(AGENT_ID_RE).describe("Agent ID (repo name)"),
         path: z.string().describe("File path relative to repo root (e.g. 'web/src/App.tsx')"),
         content: z.string().describe("File content (UTF-8)"),
         message: z.string().optional().describe("Commit message"),
+        dry_run: z.boolean().optional().describe("Preview without committing"),
       },
-      async ({ agent_id, path, content, message }) => {
-        if (!this.env.GITHUB_TOKEN) return text("GITHUB_TOKEN not configured.");
+      async ({ agent_id, path, content, message, dry_run }) => {
+        const input = { agent_id, path, message, bytes: content.length };
+        if (!isSafeRepoPath(path)) return errText(`Invalid path: ${path}`);
+        const blocked = await this.guardWrite("write_file", input, agent_id);
+        if (blocked) return blocked;
+        if (!this.env.GITHUB_TOKEN) return errText("GITHUB_TOKEN not configured.");
+        const ctx = this.safety();
         const org = this.env.GITHUB_ORG;
         const commitMsg = message ?? `Update ${path}`;
+
+        if (dry_run) {
+          await audit(ctx, { tool: "write_file", action: "dry_run", input });
+          return dryRun("write_file", input);
+        }
 
         // Check if file exists (to get SHA for update)
         const existing = (await ghApi(`/repos/${org}/${agent_id}/contents/${path}`, { token: this.env.GITHUB_TOKEN })) as { sha?: string; error?: string };
@@ -257,7 +350,12 @@ export class FagsMcpAgent extends McpAgent<Env, unknown, McpProps> {
           body,
         });
 
-        if ("error" in result) return text(`Error: ${(result as { error: string }).error}`);
+        if ("error" in result) {
+          const error = (result as { error: string }).error;
+          await audit(ctx, { tool: "write_file", action: "failed", input, result: error });
+          return errText(`Error: ${error}`);
+        }
+        await audit(ctx, { tool: "write_file", action: "success", input });
         return text(`Committed **${path}** to ${org}/${agent_id} (${commitMsg})`);
       }
     );
@@ -306,11 +404,23 @@ export class FagsMcpAgent extends McpAgent<Env, unknown, McpProps> {
     // ── upload_to_r2 ───────────────────────────────────────
     this.server.tool(
       "upload_to_r2",
-      "Trigger a rebuild and upload of an agent's dist to R2 (re-deploys the agent). Requires auth.",
-      { agent_id: z.string().describe("Agent ID to redeploy") },
-      async ({ agent_id }) => {
-        if (!this.env.GITHUB_TOKEN) return text("GITHUB_TOKEN not configured.");
+      "Trigger a rebuild and upload of an agent's dist to R2 (re-deploys the agent). Requires ownership. Supports dry_run.",
+      {
+        agent_id: z.string().regex(AGENT_ID_RE).describe("Agent ID to redeploy"),
+        dry_run: z.boolean().optional().describe("Preview without triggering a deploy"),
+      },
+      async ({ agent_id, dry_run }) => {
+        const input = { agent_id };
+        const blocked = await this.guardWrite("upload_to_r2", input, agent_id);
+        if (blocked) return blocked;
+        if (!this.env.GITHUB_TOKEN) return errText("GITHUB_TOKEN not configured.");
+        const ctx = this.safety();
         const org = this.env.GITHUB_ORG;
+
+        if (dry_run) {
+          await audit(ctx, { tool: "upload_to_r2", action: "dry_run", input });
+          return dryRun("upload_to_r2", input);
+        }
 
         // Trigger workflow dispatch
         const result = await ghApi(`/repos/${org}/${agent_id}/actions/workflows/deploy.yml/dispatches`, {
@@ -319,7 +429,12 @@ export class FagsMcpAgent extends McpAgent<Env, unknown, McpProps> {
           body: { ref: "main" },
         });
 
-        if ("error" in result) return text(`Error triggering deploy: ${(result as { error: string }).error}`);
+        if ("error" in result) {
+          const error = (result as { error: string }).error;
+          await audit(ctx, { tool: "upload_to_r2", action: "failed", input, result: error });
+          return errText(`Error triggering deploy: ${error}`);
+        }
+        await audit(ctx, { tool: "upload_to_r2", action: "success", input });
         return text(`Deploy triggered for **${agent_id}**. Check status with deploy_status tool.`);
       }
     );
@@ -461,8 +576,8 @@ async function authenticateRequest(request: Request, env: Env): Promise<{ userId
   if (!token) return {};
 
   if (env.OAUTH_KV) {
-    const fasSession = await resolveOAuthToken(token, env.OAUTH_KV);
-    if (fasSession) token = fasSession;
+    const fagsSession = await resolveOAuthToken(token, env.OAUTH_KV);
+    if (fagsSession) token = fagsSession;
   }
 
   const payload = await verifySession(token, env.SESSION_SIGNING_KEY);
@@ -475,13 +590,10 @@ export default {
     const url = new URL(request.url);
 
     // OAuth 2.1 routes
-    if (env.OAUTH_KV && env.SESSION_SIGNING_KEY) {
-      const oauthRes = await handleOAuthRoute(request, {
-        issuer: `${url.protocol}//${url.host}`,
-        fasAuthStart: `${env.API_BASE}/v1/auth/github/start`,
-        kv: env.OAUTH_KV,
-        sessionSigningKey: env.SESSION_SIGNING_KEY,
-      });
+    // OAuth is disabled (no routes served) unless OAUTH_KV + SESSION_SIGNING_KEY are bound.
+    const oauthConfig = oauthConfigFromEnv(env, `${url.protocol}//${url.host}`);
+    if (oauthConfig) {
+      const oauthRes = await handleOAuthRoute(request, oauthConfig);
       if (oauthRes) return oauthRes;
     }
 

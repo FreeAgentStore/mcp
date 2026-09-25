@@ -6,6 +6,12 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 API_BASE = "https://api.freeagentstore.online"
 GITHUB_ORG = "FreeAgentStore"
+# FAGS login entry for the MCP one-time-code flow (not /v1/auth/github, which
+# never issues the login code the /oauth/callback redeems).
+FAGS_AUTH_START = "https://freeagentstore.online/v1/auth/github/start"
+# Set MCP_READ_ONLY = "1" to disable every write tool (create_agent, delete_agent,
+# write_file, upload_to_r2). Reads still work.
+# MCP_READ_ONLY = "1"
 
 [[routes]]
 pattern = "mcp.freeagentstore.online/*"
