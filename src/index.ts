@@ -5,6 +5,7 @@ import { verifySession } from "./session.js";
 import { handleOAuthRoute, oauthConfigFromEnv, resolveOAuthToken } from "./oauth-provider.js";
 import { audit, dryRun, errText, requireConfirmation, requireWritable, type SafetyContext } from "./safety.js";
 import { AGENT_ID_RE, isSafeRepoPath } from "./guards.js";
+import { dispatchMcp, landing } from "./routing.js";
 
 interface Env {
   API_BASE: string;
@@ -15,6 +16,7 @@ interface Env {
   DB?: D1Database;
   FAGS_AUTH_START?: string;
   MCP_READ_ONLY?: string;
+  MCP_OBJECT: DurableObjectNamespace;
 }
 
 export interface McpProps extends Record<string, unknown> {
@@ -75,6 +77,13 @@ export class FagsMcpAgent extends McpAgent<Env, unknown, McpProps> {
     name: "FreeAgentStore",
     version: "0.1.0",
   });
+
+  /** Bind the caller's identity to this session (RPC from the worker entry —
+   *  see dispatchMcp). Persisted so it survives DO eviction; onStart reloads it. */
+  async setAuth(props: McpProps): Promise<void> {
+    this.props = props;
+    await this.ctx.storage.put("props", props);
+  }
 
   /** Safety context for the current caller: env for the read-only flag + audit
    *  KV, and the user id the audit trail is keyed on. */
@@ -598,38 +607,14 @@ export default {
     }
 
     if (url.pathname === "/" || url.pathname === "") {
-      if (isProtocolClient(request)) return wrongEndpoint();
-      return new Response(
-        [
-          "FreeAgentStore MCP Server",
-          "",
-          "Connect: npx mcp-remote https://mcp.freeagentstore.online/mcp",
-          "",
-          "Tools:",
-          "  list_agents     — List published agents",
-          "  agent_info      — Agent status, URLs, links",
-          "  deploy_status   — GitHub Actions deploy history",
-          "  create_agent    — Provision new agent (repo + R2 + DNS)",
-          "  delete_agent    — Remove agent from store",
-          "  write_file      — Commit file to agent repo",
-          "  read_file       — Read file from agent repo",
-          "  list_files      — Directory listing",
-          "  upload_to_r2    — Trigger redeploy",
-          "  platform_guide  — Architecture and build guide",
-          "  sdk_reference   — SDK API reference",
-          "",
-          "Auth: OAuth 2.1 (automatic via mcp-remote) or Bearer token.",
-        ].join("\n"),
-        { headers: { "content-type": "text/plain" } }
-      );
+      return landing(request);
     }
 
     if (url.pathname.startsWith("/mcp")) {
       const auth = await authenticateRequest(request, env);
-      if (auth.userId) url.searchParams.set("userId", auth.userId);
-      if (auth.token) url.searchParams.set("token", auth.token);
-      const modifiedRequest = new Request(url.toString(), request);
-      return FagsMcpAgent.serve("/mcp").fetch(modifiedRequest, env, ctx);
+      return dispatchMcp(request, env.MCP_OBJECT, auth, (req) =>
+        FagsMcpAgent.serve("/mcp").fetch(req, env, ctx),
+      );
     }
 
     // Everything else 404s rather than falling through to serve(). On
@@ -642,37 +627,3 @@ export default {
     return new Response("Not found — the MCP endpoint is /mcp", { status: 404 });
   },
 };
-
-/**
- * Is this an MCP protocol client rather than a person in a browser?
- *
- * A client pointed at the origin instead of `/mcp` asks for the event stream
- * with `GET / Accept: text/event-stream` (the legacy SSE transport), or POSTs
- * JSON-RPC. Answering either with 200 and a short non-stream body tells the
- * client "stream opened" and then drops it — and the spec-correct response to a
- * dropped stream is to reconnect, so it redials ~1/sec, forever. The flood is
- * invisible: every response is a 200, nothing throws, no AI tokens are spent,
- * nothing is written to D1, and the MCP rate limiter only counts `tools/call`
- * messages carrying an account, which a bare GET has neither of.
- *
- * OPTIONS and HEAD deliberately return false so CORS preflight is unaffected.
- */
-function isProtocolClient(request: Request): boolean {
-  if (request.method === "POST") return true;
-  return (request.headers.get("accept") ?? "").includes("text/event-stream");
-}
-
-/** The JSON-RPC 405 the MCP spec requires from an endpoint with no stream to offer. */
-function wrongEndpoint(): Response {
-  return new Response(
-    JSON.stringify({
-      jsonrpc: "2.0",
-      id: null,
-      error: {
-        code: -32000,
-        message: "Method Not Allowed — the MCP endpoint is https://mcp.freeagentstore.online/mcp",
-      },
-    }),
-    { status: 405, headers: { "content-type": "application/json", allow: "GET, HEAD" } },
-  );
-}
